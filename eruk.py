@@ -30,6 +30,7 @@ import os
 import re
 import sys
 import time
+import urllib.request
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -50,6 +51,10 @@ HEADLESS = os.environ.get("ERUK_HEADLESS", "0") == "1"   # visible browser by de
 HERE = Path(__file__).resolve().parent
 OUTPUT = HERE / "eruk_exchange.xlsx"
 HISTORY_CSV = HERE / f"eruk_history_{BASE.lower()}.csv"   # USD history (the old GBP one is no longer used)
+CBUAE_CSV = HERE / "cbuae_aed_history.csv"           # AED history from the Central Bank of the UAE
+CBUAE_URL = os.environ.get("CBUAE_URL", "https://www.centralbank.ae/umbraco/Surface/Exchange/"
+                           "GetExchangeRateAllCurrencyDate?dateTime={date}")
+CBUAE_CODES = {"AED"}                    # currencies taken from the CBUAE instead of ERUK
 DEBUG_DIR = HERE / "debug"
 PROFILE_DIR = HERE / "browser_profile"   # keeps Cloudflare cookies between runs
 WAIT_FOR_YOU = 120                       # seconds to tick "Verify you are human" when challenged
@@ -210,20 +215,74 @@ def load_history():
     if HISTORY_CSV.exists():
         df = pd.read_csv(HISTORY_CSV, parse_dates=["Date"])
         for row in df.itertuples(index=False):
-            if row.Currency in store and row.Date.date() <= TODAY:
+            if row.Currency in store and row.Currency not in CBUAE_CODES and row.Date.date() <= TODAY:
                 store[row.Currency][row.Date.date()] = float(row.Rate)
         print(f"Loaded {len(df)} stored rates from {HISTORY_CSV.name}")
+    if CBUAE_CSV.exists():                            # AED only ever comes from the CBUAE file
+        df = pd.read_csv(CBUAE_CSV, parse_dates=["Date"])
+        for row in df.itertuples(index=False):
+            if row.Currency in CBUAE_CODES and row.Date.date() <= TODAY:
+                store[row.Currency][row.Date.date()] = float(row.Rate)
+        print(f"Loaded {len(df)} stored CBUAE rates from {CBUAE_CSV.name}")
     return store
 
 
 def save_history(store):
-    rows = [(d, c, r) for c, series in store.items() for d, r in series.items()]
-    df = pd.DataFrame(rows, columns=["Date", "Currency", "Rate"]).sort_values(["Date", "Currency"])
-    df.to_csv(HISTORY_CSV, index=False, date_format="%Y-%m-%d")
+    for path, keep in ((HISTORY_CSV, lambda c: c not in CBUAE_CODES), (CBUAE_CSV, lambda c: c in CBUAE_CODES)):
+        rows = [(d, c, r) for c, series in store.items() if keep(c) for d, r in series.items()]
+        df = pd.DataFrame(rows, columns=["Date", "Currency", "Rate"]).sort_values(["Date", "Currency"])
+        df.to_csv(path, index=False, date_format="%Y-%m-%d")
+
+
+# ---------------- CBUAE (AED) ----------------
+CB_DATE = re.compile(rf"Last updated:?\s*(?:\w+day\s+)?(\d{{1,2}}\s+(?:{MONTHS})\s+\d{{4}})", re.I)
+CB_USD = re.compile(r"US Dollar\s+([\d.]+)", re.I)
+
+
+def cbuae_day(d):
+    """Returns (published date, AED per 1 USD) for one day from the CBUAE, or (None, None)."""
+    req = urllib.request.Request(CBUAE_URL.format(date=d.isoformat()), headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        html = r.read().decode("utf-8", "replace")
+    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html))
+    md, mr = CB_DATE.search(text), CB_USD.search(text)
+    if not (md and mr):
+        return None, None
+    return datetime.strptime(md.group(1), "%d %B %Y").date(), float(mr.group(1))
+
+
+def fetch_cbuae(store):
+    """AED from the Central Bank of the UAE: official rate, published Monday-Friday at 6pm UAE time."""
+    if "AED" not in store:
+        return
+    have = store["AED"]
+    todo = [date(START_YEAR, 1, 1) + timedelta(days=i) for i in range((TODAY - date(START_YEAR, 1, 1)).days + 1)]
+    todo = [d for d in todo if d.weekday() < 5 and d not in have]
+    if not todo:
+        return
+    print(f"\nUSD/AED from the Central Bank of the UAE ({len(todo)} day(s))")
+    added = failed = 0
+    for d in todo:
+        try:
+            published, rate = cbuae_day(d)
+        except Exception as e:
+            failed += 1
+            if failed >= 3 and added == 0:
+                print(f"  could not reach the CBUAE site ({e.__class__.__name__}); AED keeps its stored rates")
+                return
+            continue
+        if rate is None or rate <= 0 or published is None or published > d:
+            continue
+        # on a UAE/market holiday the CBUAE repeats the previous day's rate; take it once the day is past
+        if published == d or (TODAY - d).days > 3:
+            have[d] = round(rate, 6)
+            added += 1
+        time.sleep(0.3)
+    print(f"  {added} day(s) added")
 
 
 def scrape_all(store):
-    to_scrape = [c for c in CURRENCIES if c != BASE and c not in PEGGED_TO_EUR]
+    to_scrape = [c for c in CURRENCIES if c != BASE and c not in PEGGED_TO_EUR and c not in CBUAE_CODES]
     with sync_playwright() as p:
         browser = p.chromium.launch_persistent_context(
             PROFILE_DIR,
@@ -483,7 +542,7 @@ def write_latest_sheet(wb, created, wide):
 
 def write_history_sheet(wb, created, wide):
     ws = wb["ERUK History"]
-    put(ws, 1, 1, f"Daily rate {BASE} to XXX _ Source Exchange Rates UK",
+    put(ws, 1, 1, f"Daily rate {BASE} to XXX _ Source Exchange Rates UK (AED: Central Bank of the UAE)",
         font=Font(name="Arial", size=10, bold=True, italic=True))
     put(ws, 2, 1, BASE_URL, font=Font(name="Arial", size=10, underline="single", color="0563C1")).hyperlink = BASE_URL
     put(ws, 4, 1, "History Database", font=Font(name="Arial", size=10, bold=True, italic=True, underline="single"))
@@ -524,13 +583,15 @@ def main():
     check_not_locked()
     store = load_history()
     scrape_all(store)
+    fetch_cbuae(store)
+    save_history(store)
     wide = build_daily(store)
     if wide is None or wide.drop(columns=BASE).isna().all().all():
         sys.exit("Nothing scraped. Check the files in the debug folder.")
 
     base_wide = wide                                        # already 1 BASE = x, straight from ERUK
     avg, close = monthly_tables(base_wide)
-    run_note = f"Source: exchangerates.org.uk, pulled {datetime.now():%d/%m/%Y %H:%M}."
+    run_note = f"Source: exchangerates.org.uk; AED: Central Bank of the UAE. Pulled {datetime.now():%d/%m/%Y %H:%M}."
 
     wb, created = open_workbook()
     write_average_sheet(wb, created, avg, run_note)
