@@ -1,8 +1,8 @@
 """
-ERUK (exchangerates.org.uk) daily GBP rates, converted to USD base -> Excel in the company template format
+ERUK (exchangerates.org.uk) daily rates, pulled straight from the USD pages -> Excel in the company template format
 
 Workbook (eruk_exchange.xlsx), updated in place on every run:
-All sheets use BASE (USD): 1 USD = x currency, worked out daily as (GBP/CCY) / (GBP/USD).
+All sheets use BASE (USD): 1 USD = x currency, taken as published on ERUK's USD-XXX pages (no conversion).
     Average Currency_PL          subs currencies only, monthly averages,
                                  one table per year (a new table appears each January)
     Closing Rate_CASH Position   month-end close, 18 template currencies, USD first column = 1
@@ -42,20 +42,20 @@ from playwright.sync_api import sync_playwright
 
 # ---------------- settings ----------------
 BASE_URL = os.environ.get("ERUK_BASE", "https://www.exchangerates.org.uk")
+BASE = "USD"                             # base currency: pulls ERUK's USD-XXX pages, 1 USD = x on every sheet
 TODAY = date.fromisoformat(os.environ["ERUK_TODAY"]) if os.environ.get("ERUK_TODAY") else date.today()
 START_YEAR = 2026                        # first year in the workbook; set earlier to backfill
 ONLY_COMPLETE_MONTHS = True              # running month stays out of averages and closes
 HEADLESS = os.environ.get("ERUK_HEADLESS", "0") == "1"   # visible browser by default
 HERE = Path(__file__).resolve().parent
 OUTPUT = HERE / "eruk_exchange.xlsx"
-HISTORY_CSV = HERE / "eruk_history.csv"
+HISTORY_CSV = HERE / f"eruk_history_{BASE.lower()}.csv"   # USD history (the old GBP one is no longer used)
 DEBUG_DIR = HERE / "debug"
 PROFILE_DIR = HERE / "browser_profile"   # keeps Cloudflare cookies between runs
 WAIT_FOR_YOU = 120                       # seconds to tick "Verify you are human" when challenged
 WAIT_NORMAL = 15                         # seconds to wait for the table on a normal page
 PAUSE_BETWEEN_PAGES = 3                  # raise this if Cloudflare keeps re-challenging
 MAX_GAP_DAYS = 7                         # a bigger hole in a year's history triggers the yearly page
-BASE = "USD"                             # base currency for every sheet (1 USD = x); any listed code works
 # ------------------------------------------
 
 # Subsidiaries and their currency, same as the template
@@ -131,8 +131,8 @@ def parse_date(text):
 
 
 def rate_regex(code):
-    # "1 GBP = 1.3456 USD", "£1 GBP = $1.3456", "1 GBP = 21,345.67 IDR", "£1 GBP = Rp 21,345"
-    return re.compile(rf"1\s*GBP\s*=\s*[^\d\n]{{0,8}}?([\d,]+(?:\.\d+)?)\s*(?:{code})?", re.I)
+    # "1 USD = 3.6725 AED", "$1 USD = €0.8566", "1 USD = 16,345.67 IDR", "$1 USD = Rp 16,345"
+    return re.compile(rf"1\s*{BASE}\s*=\s*[^\d\n]{{0,8}}?([\d,]+(?:\.\d+)?)\s*(?:{code})?", re.I)
 
 
 def save_debug(page, name):
@@ -165,7 +165,7 @@ def scrape_page(page, url, code):
     if challenged:
         print("    Cloudflare check showing - tick 'Verify you are human' in the browser window")
     try:
-        page.wait_for_function("() => /GBP\\s*=/.test(document.body.innerText)",
+        page.wait_for_function(f"() => /{BASE}\\s*=/.test(document.body.innerText)",
                                timeout=(WAIT_FOR_YOU if challenged else WAIT_NORMAL) * 1000)
     except Exception:
         pass
@@ -223,7 +223,7 @@ def save_history(store):
 
 
 def scrape_all(store):
-    to_scrape = [c for c in CURRENCIES if c != "GBP" and c not in PEGGED_TO_EUR]
+    to_scrape = [c for c in CURRENCIES if c != BASE and c not in PEGGED_TO_EUR]
     with sync_playwright() as p:
         browser = p.chromium.launch_persistent_context(
             PROFILE_DIR,
@@ -235,12 +235,12 @@ def scrape_all(store):
         page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         try:
             for ccy in to_scrape:
-                print(f"\nGBP/{ccy}")
-                store[ccy].update(scrape_page(page, f"{BASE_URL}/GBP-{ccy}-exchange-rate-history.html", ccy))
+                print(f"\n{BASE}/{ccy}")
+                store[ccy].update(scrape_page(page, f"{BASE_URL}/{BASE}-{ccy}-exchange-rate-history.html", ccy))
                 time.sleep(PAUSE_BETWEEN_PAGES)
                 for year in range(START_YEAR, TODAY.year + 1):
                     if year_has_gaps(store[ccy].keys(), year):
-                        url = f"{BASE_URL}/GBP-{ccy}-spot-exchange-rates-history-{year}.html"
+                        url = f"{BASE_URL}/{BASE}-{ccy}-spot-exchange-rates-history-{year}.html"
                         store[ccy].update(scrape_page(page, url, ccy))
                         time.sleep(PAUSE_BETWEEN_PAGES)
         finally:
@@ -260,7 +260,7 @@ def build_daily(store):
         if c not in wide:
             wide[c] = float("nan")
     wide.sort_index(inplace=True)
-    wide["GBP"] = 1.0
+    wide[BASE] = 1.0
     for ccy, per_eur in PEGGED_TO_EUR.items():
         wide[ccy] = wide["EUR"] * per_eur
     return wide[CURRENCIES].round(6)
@@ -284,16 +284,20 @@ FONT = Font(name="Arial", size=10)
 BOLD = Font(name="Arial", size=10, bold=True)
 NOTE = Font(name="Arial", size=9, italic=True)
 HEAD_FILL = PatternFill("solid", start_color="D9E1F2")
-RATE_FMT = "#,##0.000000"
+RATE_FMT = "#,##0.000000"                   # monthly averages (calculated, 6 decimals)
+SITE_FMT = "#,##0.0000"                     # daily and closing rates: 4 decimals, as shown on ERUK
 SHEETS = ["Average Currency_PL", "Closing Rate_CASH Position", "Daily Rate GESCO", "ERUK History"]
 SOURCE_CELL = (24, 5)                       # E24, just above the first average table
 
 
-def put(ws, row, col, value, fmt=None, font=None, fill=None):
-    """Write a value; style the cell only if it was empty, so existing formatting is never touched."""
+def put(ws, row, col, value, fmt=None, font=None, fill=None, force_fmt=False):
+    """Write a value; style the cell only if it was empty, so existing formatting is never touched.
+    force_fmt re-applies the number format on existing cells too (fills and fonts are still left alone)."""
     c = ws.cell(row, col)
     new = c.value is None
     c.value = value
+    if force_fmt and fmt and value is not None:
+        c.number_format = fmt
     if new and value is not None:
         c.font = font or FONT
         if fmt:
@@ -431,7 +435,7 @@ def write_closing_sheet(wb, created, close):
             if head == "zero/empty":
                 put(ws, r, j, 0, fmt="0.0000")
             else:
-                put(ws, r, j, float(vals[head]) if pd.notna(vals[head]) else None, fmt=RATE_FMT)
+                put(ws, r, j, float(vals[head]) if pd.notna(vals[head]) else None, fmt=SITE_FMT, force_fmt=True)
 
     if created["Closing Rate_CASH Position"]:
         ws.column_dimensions["A"].width = 12
@@ -465,7 +469,7 @@ def write_latest_sheet(wb, created, wide):
         put(ws, r, 1, s.index[-1].date() if not s.empty else None, fmt="dd/mm/yyyy")
         put(ws, r, 2, name)
         put(ws, r, 3, label)
-        put(ws, r, 4, float(s.iloc[-1]) if not s.empty else None, fmt=RATE_FMT)
+        put(ws, r, 4, float(s.iloc[-1]) if not s.empty else None, fmt=SITE_FMT, force_fmt=True)
     r = last + 1                                          # clear leftovers from older layouts
     while any(ws.cell(r, j).value is not None for j in range(1, 5)):
         for j in range(1, 5):
@@ -504,7 +508,10 @@ def write_history_sheet(wb, created, wide):
                 put(ws, row, 1, d.date(), fmt="dd/mm/yyyy")
                 put(ws, row, 2, NAMES[label])
                 put(ws, row, 3, label)
-            put(ws, row, 4, float(v), fmt=RATE_FMT)
+            put(ws, row, 4, float(v), fmt=SITE_FMT, force_fmt=True)
+            existing.pop((d.date(), label), None)
+    for row in existing.values():                     # rows with no rate any more (e.g. pair not on ERUK)
+        ws.cell(row, 4).value = None
     if last > 6:
         ensure_table(ws, "ERUK_History", f"A6:D{last}")
     if created["ERUK History"]:
@@ -518,10 +525,10 @@ def main():
     store = load_history()
     scrape_all(store)
     wide = build_daily(store)
-    if wide is None or wide.drop(columns="GBP").isna().all().all():
+    if wide is None or wide.drop(columns=BASE).isna().all().all():
         sys.exit("Nothing scraped. Check the files in the debug folder.")
 
-    base_wide = wide if BASE == "GBP" else wide.div(wide[BASE], axis=0).round(6)   # 1 BASE = x, day by day
+    base_wide = wide                                        # already 1 BASE = x, straight from ERUK
     avg, close = monthly_tables(base_wide)
     run_note = f"Source: exchangerates.org.uk, pulled {datetime.now():%d/%m/%Y %H:%M}."
 
@@ -539,7 +546,7 @@ def main():
     missing = [c for c in CURRENCIES if wide[c].isna().all()]
     if missing:
         print("No data for: " + ", ".join(missing) + " (ERUK may not list them, see the debug folder)")
-    latest = wide.drop(columns="GBP").dropna(how="all").index.max().date()
+    latest = wide.drop(columns=BASE).dropna(how="all").index.max().date()
     if (TODAY - latest).days > 7:
         print(f"WARNING: newest rate is from {latest:%d/%m/%Y}. Pages probably failed to load this run.")
     for c in CURRENCIES:
