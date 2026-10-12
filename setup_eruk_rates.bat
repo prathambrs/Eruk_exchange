@@ -9,7 +9,7 @@ if errorlevel 1 goto nopython
 
 echo Installing the tools the rates script needs. This takes a few minutes.
 echo.
-%PY% -m pip install --upgrade playwright pandas openpyxl
+%PY% -m pip install --upgrade playwright pandas openpyxl truststore
 if errorlevel 1 goto failed
 %PY% -m playwright install chromium
 if errorlevel 1 goto failed

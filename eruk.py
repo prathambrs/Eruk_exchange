@@ -2,7 +2,9 @@
 ERUK (exchangerates.org.uk) daily rates, pulled straight from the USD pages -> Excel in the company template format
 
 Workbook (eruk_exchange.xlsx), updated in place on every run:
-All sheets use BASE (USD): 1 USD = x currency, taken as published on ERUK's USD-XXX pages (no conversion).
+All sheets use BASE (USD): 1 USD = x currency, taken as published on ERUK's USD-XXX pages (no conversion),
+except AED (Central Bank of the UAE, cbuae_aed_history.csv) and EUR (ECB reference rate, inverted to
+1 USD = x EUR, ecb_eur_history.csv).
     Average Currency_PL          subs currencies only, monthly averages,
                                  one table per year (a new table appears each January)
     Closing Rate_CASH Position   month-end close, 18 template currencies, USD first column = 1
@@ -31,6 +33,7 @@ import re
 import sys
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -40,6 +43,15 @@ from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from playwright.sync_api import sync_playwright
+
+VERSION = "2026-10-12 v4 (EUR 4 decimals)"
+
+try:                                     # use the Windows certificate store, so office networks that inspect
+    import truststore                    # HTTPS (corporate root certificate) do not break direct downloads
+    truststore.inject_into_ssl()
+    CERTS = "Windows certificate store (truststore)"
+except ImportError:
+    CERTS = "Python's own certificates (run: pip install truststore)"
 
 # ---------------- settings ----------------
 BASE_URL = os.environ.get("ERUK_BASE", "https://www.exchangerates.org.uk")
@@ -55,6 +67,11 @@ CBUAE_CSV = HERE / "cbuae_aed_history.csv"           # AED history from the Cent
 CBUAE_URL = os.environ.get("CBUAE_URL", "https://www.centralbank.ae/umbraco/Surface/Exchange/"
                            "GetExchangeRateAllCurrencyDate?dateTime={date}")
 CBUAE_CODES = {"AED"}                    # currencies taken from the CBUAE instead of ERUK
+ECB_CSV = HERE / "ecb_eur_history.csv"               # EUR history from the European Central Bank
+ECB_URL = os.environ.get("ECB_URL", "https://www.ecb.europa.eu/stats/policy_and_exchange_rates/"
+                         "euro_reference_exchange_rates/html/usd.xml")
+OFFICIAL = {"AED": CBUAE_CSV, "EUR": ECB_CSV}       # currency -> its own history file (not from ERUK)
+CALC_CODES = set()                       # codes shown with 6 decimals in daily/closing sheets (none: all 4, like the sites)
 DEBUG_DIR = HERE / "debug"
 PROFILE_DIR = HERE / "browser_profile"   # keeps Cloudflare cookies between runs
 WAIT_FOR_YOU = 120                       # seconds to tick "Verify you are human" when challenged
@@ -215,20 +232,23 @@ def load_history():
     if HISTORY_CSV.exists():
         df = pd.read_csv(HISTORY_CSV, parse_dates=["Date"])
         for row in df.itertuples(index=False):
-            if row.Currency in store and row.Currency not in CBUAE_CODES and row.Date.date() <= TODAY:
+            if row.Currency in store and row.Currency not in OFFICIAL and row.Date.date() <= TODAY:
                 store[row.Currency][row.Date.date()] = float(row.Rate)
         print(f"Loaded {len(df)} stored rates from {HISTORY_CSV.name}")
-    if CBUAE_CSV.exists():                            # AED only ever comes from the CBUAE file
-        df = pd.read_csv(CBUAE_CSV, parse_dates=["Date"])
-        for row in df.itertuples(index=False):
-            if row.Currency in CBUAE_CODES and row.Date.date() <= TODAY:
-                store[row.Currency][row.Date.date()] = float(row.Rate)
-        print(f"Loaded {len(df)} stored CBUAE rates from {CBUAE_CSV.name}")
+    for code, path in OFFICIAL.items():               # AED / EUR only ever come from their own files
+        if path.exists():
+            df = pd.read_csv(path, parse_dates=["Date"])
+            for row in df.itertuples(index=False):
+                if row.Currency == code and row.Date.date() <= TODAY:
+                    store[code][row.Date.date()] = float(row.Rate)
+            print(f"Loaded {len(df)} stored {code} rates from {path.name}")
     return store
 
 
 def save_history(store):
-    for path, keep in ((HISTORY_CSV, lambda c: c not in CBUAE_CODES), (CBUAE_CSV, lambda c: c in CBUAE_CODES)):
+    targets = [(HISTORY_CSV, lambda c: c not in OFFICIAL)]
+    targets += [(path, lambda c, code=code: c == code) for code, path in OFFICIAL.items()]
+    for path, keep in targets:
         rows = [(d, c, r) for c, series in store.items() if keep(c) for d, r in series.items()]
         df = pd.DataFrame(rows, columns=["Date", "Currency", "Rate"]).sort_values(["Date", "Currency"])
         df.to_csv(path, index=False, date_format="%Y-%m-%d")
@@ -239,11 +259,50 @@ CB_DATE = re.compile(rf"Last updated:?\s*(?:\w+day\s+)?(\d{{1,2}}\s+(?:{MONTHS})
 CB_USD = re.compile(r"US Dollar\s+([\d.]+)", re.I)
 
 
-def cbuae_day(d):
-    """Returns (published date, AED per 1 USD) for one day from the CBUAE, or (None, None)."""
-    req = urllib.request.Request(CBUAE_URL.format(date=d.isoformat()), headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        html = r.read().decode("utf-8", "replace")
+class Getter:
+    """Plain web requests for the CBUAE and the ECB. Tries Python's own downloader first (fast); if the
+    network blocks it (corporate proxy or certificate inspection, shows as URLError), it switches to the
+    same Chrome browser that already loads ERUK, which uses the laptop's proxy and certificates."""
+
+    def __init__(self, ctx):
+        self.ctx, self.page, self.use_browser = ctx, None, False
+
+    def direct(self, url, timeout=30):
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read().decode("utf-8", "replace")
+
+    def via_browser(self, url, timeout=60):
+        if self.page is None:
+            self.page = self.ctx.new_page()
+        try:
+            resp = self.page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+        except Exception as e:
+            if "Download is starting" not in str(e):
+                raise
+            # the site sends this file as a download (the ECB does), so catch the download and read it
+            with self.page.expect_download(timeout=timeout * 1000) as dl:
+                try:
+                    self.page.goto(url, timeout=timeout * 1000)
+                except Exception:
+                    pass
+            return Path(dl.value.path()).read_text(encoding="utf-8", errors="replace")
+        if resp is None or not resp.ok:
+            raise RuntimeError(f"HTTP {resp.status if resp else 'no response'}")
+        return resp.text()
+
+    def get(self, url, timeout=30):
+        if not self.use_browser:
+            try:
+                return self.direct(url, timeout)
+            except Exception as e:
+                self.use_browser = True
+                print(f"  direct download blocked ({getattr(e, 'reason', e)}); using the browser instead")
+        return self.via_browser(url, timeout)
+
+
+def parse_cbuae(html):
+    """Returns (published date, AED per 1 USD) from one CBUAE rates table, or (None, None)."""
     text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html))
     md, mr = CB_DATE.search(text), CB_USD.search(text)
     if not (md and mr):
@@ -251,7 +310,7 @@ def cbuae_day(d):
     return datetime.strptime(md.group(1), "%d %B %Y").date(), float(mr.group(1))
 
 
-def fetch_cbuae(store):
+def fetch_cbuae(store, getter):
     """AED from the Central Bank of the UAE: official rate, published Monday-Friday at 6pm UAE time."""
     if "AED" not in store:
         return
@@ -261,50 +320,99 @@ def fetch_cbuae(store):
     if not todo:
         return
     print(f"\nUSD/AED from the Central Bank of the UAE ({len(todo)} day(s))")
-    added = failed = 0
-    for d in todo:
+    url = lambda d: CBUAE_URL.format(date=d.isoformat())
+
+    def one(d, fetch):
         try:
-            published, rate = cbuae_day(d)
+            return d, parse_cbuae(fetch(url(d))), None
         except Exception as e:
-            failed += 1
-            if failed >= 3 and added == 0:
-                print(f"  could not reach the CBUAE site ({e.__class__.__name__}); AED keeps its stored rates")
+            return d, (None, None), e
+
+    first = one(todo[0], getter.get)                  # also decides direct download vs browser
+    if getter.use_browser:
+        results = (one(d, getter.via_browser) if i else first for i, d in enumerate(todo))
+        pool = None
+    else:
+        pool = ThreadPoolExecutor(max_workers=8)      # direct downloads can run 8 at a time
+        rest = pool.map(lambda d: one(d, getter.direct), todo[1:])
+        results = (r for part in ([first], rest) for r in part)
+
+    added = failed = done = 0
+    err = None
+    try:
+        for d, (published, rate), e in results:
+            done += 1
+            if e is not None:
+                failed, err = failed + 1, e
+            elif rate and rate > 0 and published and published <= d:
+                # on a UAE/market holiday the CBUAE repeats the previous day's rate; take it once the day is past
+                if published == d or (TODAY - d).days > 3:
+                    have[d] = round(rate, 6)
+                    added += 1
+            if done % 20 == 0 or done == len(todo):
+                print(f"  {done}/{len(todo)} checked, {added} added", flush=True)
+            if failed >= 5 and added == 0:
+                print(f"  could not reach the CBUAE site ({getattr(err, 'reason', err)}); AED keeps its stored rates")
                 return
-            continue
-        if rate is None or rate <= 0 or published is None or published > d:
-            continue
-        # on a UAE/market holiday the CBUAE repeats the previous day's rate; take it once the day is past
-        if published == d or (TODAY - d).days > 3:
-            have[d] = round(rate, 6)
-            added += 1
-        time.sleep(0.3)
-    print(f"  {added} day(s) added")
+    finally:
+        if pool:
+            pool.shutdown(wait=False, cancel_futures=True)
+    if failed:
+        print(f"  {failed} day(s) could not be loaded; they will be retried on the next run")
 
 
-def scrape_all(store):
-    to_scrape = [c for c in CURRENCIES if c != BASE and c not in PEGGED_TO_EUR and c not in CBUAE_CODES]
-    with sync_playwright() as p:
-        browser = p.chromium.launch_persistent_context(
-            PROFILE_DIR,
-            headless=HEADLESS,
-            args=["--disable-blink-features=AutomationControlled", "--use-fake-ui-for-media-stream"],
-            ignore_default_args=["--enable-automation"],
-        )
-        page = browser.pages[0] if browser.pages else browser.new_page()
-        page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        try:
-            for ccy in to_scrape:
-                print(f"\n{BASE}/{ccy}")
-                store[ccy].update(scrape_page(page, f"{BASE_URL}/{BASE}-{ccy}-exchange-rate-history.html", ccy))
+# ---------------- ECB (EUR) ----------------
+ECB_OBS = re.compile(r'TIME_PERIOD="(\d{4}-\d{2}-\d{2})"\s+OBS_VALUE="([\d.]+)"')
+
+
+def fetch_ecb(store, getter):
+    """EUR from the ECB euro reference rate (published around 16:00 CET on TARGET working days).
+    The ECB quotes 1 EUR = x USD; with USD as the base we store 1 USD = 1/x EUR."""
+    if "EUR" not in store:
+        return
+    print("\nUSD/EUR from the European Central Bank")
+    try:
+        xml = getter.get(ECB_URL, timeout=90)
+    except Exception as e:
+        print(f"  could not reach the ECB site ({getattr(e, 'reason', e)}); EUR keeps its stored rates")
+        return
+    found = ECB_OBS.findall(xml)
+    if not found:
+        print("  the ECB file had no rates in it; EUR keeps its stored rates")
+        return
+    added = 0
+    for ds, v in found:
+        d = date.fromisoformat(ds)
+        if date(START_YEAR, 1, 1) <= d <= TODAY and float(v) > 0:
+            if d not in store["EUR"]:
+                added += 1
+            store["EUR"][d] = round(1 / float(v), 4)      # 4 decimals, like every other daily rate
+    print(f"  {added} new day(s)" if added else "  up to date")
+
+
+def launch_browser(p):
+    ctx = p.chromium.launch_persistent_context(
+        PROFILE_DIR,
+        headless=HEADLESS,
+        args=["--disable-blink-features=AutomationControlled", "--use-fake-ui-for-media-stream"],
+        ignore_default_args=["--enable-automation"],
+    )
+    ctx.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    return ctx
+
+
+def scrape_all(store, ctx):
+    to_scrape = [c for c in CURRENCIES if c != BASE and c not in PEGGED_TO_EUR and c not in OFFICIAL]
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    for ccy in to_scrape:
+        print(f"\n{BASE}/{ccy}")
+        store[ccy].update(scrape_page(page, f"{BASE_URL}/{BASE}-{ccy}-exchange-rate-history.html", ccy))
+        time.sleep(PAUSE_BETWEEN_PAGES)
+        for year in range(START_YEAR, TODAY.year + 1):
+            if year_has_gaps(store[ccy].keys(), year):
+                url = f"{BASE_URL}/{BASE}-{ccy}-spot-exchange-rates-history-{year}.html"
+                store[ccy].update(scrape_page(page, url, ccy))
                 time.sleep(PAUSE_BETWEEN_PAGES)
-                for year in range(START_YEAR, TODAY.year + 1):
-                    if year_has_gaps(store[ccy].keys(), year):
-                        url = f"{BASE_URL}/{BASE}-{ccy}-spot-exchange-rates-history-{year}.html"
-                        store[ccy].update(scrape_page(page, url, ccy))
-                        time.sleep(PAUSE_BETWEEN_PAGES)
-        finally:
-            browser.close()
-            save_history(store)          # keep whatever was pulled, even if the run stops halfway
 
 
 # ---------------- tables ----------------
@@ -345,6 +453,10 @@ NOTE = Font(name="Arial", size=9, italic=True)
 HEAD_FILL = PatternFill("solid", start_color="D9E1F2")
 RATE_FMT = "#,##0.000000"                   # monthly averages (calculated, 6 decimals)
 SITE_FMT = "#,##0.0000"                     # daily and closing rates: 4 decimals, as shown on ERUK
+
+
+def fmt_for(code):
+    return RATE_FMT if code in CALC_CODES else SITE_FMT
 SHEETS = ["Average Currency_PL", "Closing Rate_CASH Position", "Daily Rate GESCO", "ERUK History"]
 SOURCE_CELL = (24, 5)                       # E24, just above the first average table
 
@@ -494,7 +606,7 @@ def write_closing_sheet(wb, created, close):
             if head == "zero/empty":
                 put(ws, r, j, 0, fmt="0.0000")
             else:
-                put(ws, r, j, float(vals[head]) if pd.notna(vals[head]) else None, fmt=SITE_FMT, force_fmt=True)
+                put(ws, r, j, float(vals[head]) if pd.notna(vals[head]) else None, fmt=fmt_for(head), force_fmt=True)
 
     if created["Closing Rate_CASH Position"]:
         ws.column_dimensions["A"].width = 12
@@ -528,7 +640,7 @@ def write_latest_sheet(wb, created, wide):
         put(ws, r, 1, s.index[-1].date() if not s.empty else None, fmt="dd/mm/yyyy")
         put(ws, r, 2, name)
         put(ws, r, 3, label)
-        put(ws, r, 4, float(s.iloc[-1]) if not s.empty else None, fmt=SITE_FMT, force_fmt=True)
+        put(ws, r, 4, float(s.iloc[-1]) if not s.empty else None, fmt=fmt_for(iso(label)), force_fmt=True)
     r = last + 1                                          # clear leftovers from older layouts
     while any(ws.cell(r, j).value is not None for j in range(1, 5)):
         for j in range(1, 5):
@@ -542,7 +654,7 @@ def write_latest_sheet(wb, created, wide):
 
 def write_history_sheet(wb, created, wide):
     ws = wb["ERUK History"]
-    put(ws, 1, 1, f"Daily rate {BASE} to XXX _ Source Exchange Rates UK (AED: Central Bank of the UAE)",
+    put(ws, 1, 1, f"Daily rate {BASE} to XXX _ Source Exchange Rates UK (AED: Central Bank of the UAE, EUR: ECB)",
         font=Font(name="Arial", size=10, bold=True, italic=True))
     put(ws, 2, 1, BASE_URL, font=Font(name="Arial", size=10, underline="single", color="0563C1")).hyperlink = BASE_URL
     put(ws, 4, 1, "History Database", font=Font(name="Arial", size=10, bold=True, italic=True, underline="single"))
@@ -567,7 +679,7 @@ def write_history_sheet(wb, created, wide):
                 put(ws, row, 1, d.date(), fmt="dd/mm/yyyy")
                 put(ws, row, 2, NAMES[label])
                 put(ws, row, 3, label)
-            put(ws, row, 4, float(v), fmt=SITE_FMT, force_fmt=True)
+            put(ws, row, 4, float(v), fmt=fmt_for(iso(label)), force_fmt=True)
             existing.pop((d.date(), label), None)
     for row in existing.values():                     # rows with no rate any more (e.g. pair not on ERUK)
         ws.cell(row, 4).value = None
@@ -580,18 +692,29 @@ def write_history_sheet(wb, created, wide):
 
 
 def main():
+    print(f"eruk.py version {VERSION}")
+    print(f"File: {Path(__file__).resolve()}")
+    print(f"Certificates: {CERTS}\n")
     check_not_locked()
     store = load_history()
-    scrape_all(store)
-    fetch_cbuae(store)
-    save_history(store)
+    with sync_playwright() as p:
+        ctx = launch_browser(p)
+        try:
+            scrape_all(store, ctx)
+            getter = Getter(ctx)
+            fetch_cbuae(store, getter)
+            fetch_ecb(store, getter)
+        finally:
+            ctx.close()
+            save_history(store)                       # keep whatever was pulled, even if the run stops halfway
     wide = build_daily(store)
     if wide is None or wide.drop(columns=BASE).isna().all().all():
         sys.exit("Nothing scraped. Check the files in the debug folder.")
 
     base_wide = wide                                        # already 1 BASE = x, straight from ERUK
     avg, close = monthly_tables(base_wide)
-    run_note = f"Source: exchangerates.org.uk; AED: Central Bank of the UAE. Pulled {datetime.now():%d/%m/%Y %H:%M}."
+    run_note = (f"Source: exchangerates.org.uk; AED: Central Bank of the UAE; EUR: ECB reference rate "
+                f"(1 / ECB USD rate). Pulled {datetime.now():%d/%m/%Y %H:%M}.")
 
     wb, created = open_workbook()
     write_average_sheet(wb, created, avg, run_note)
@@ -606,7 +729,9 @@ def main():
     print(f"\nDone. {len(wide)} days, {len(close)} closed months -> {OUTPUT.name}")
     missing = [c for c in CURRENCIES if wide[c].isna().all()]
     if missing:
-        print("No data for: " + ", ".join(missing) + " (ERUK may not list them, see the debug folder)")
+        names = {"AED": "Central Bank of the UAE", "EUR": "ECB"}
+        print("No data for: " + ", ".join(f"{c} ({names.get(c, 'ERUK')})" for c in missing)
+              + ". Check the messages above, or the debug folder for ERUK pages.")
     latest = wide.drop(columns=BASE).dropna(how="all").index.max().date()
     if (TODAY - latest).days > 7:
         print(f"WARNING: newest rate is from {latest:%d/%m/%Y}. Pages probably failed to load this run.")
